@@ -20,6 +20,7 @@ from tkinter import filedialog, messagebox, ttk
 import customtkinter as ctk
 
 import config
+import funds
 import instruments
 import logger as logmod
 import portfolio as pf
@@ -357,7 +358,8 @@ class App(ctk.CTk):
         self.stat = {}
         for key, title in (("capital", "Capital"), ("value", "Holdings value"),
                            ("slot_cash", "Slot cash free"), ("reserve", "Reserve (averaging)"),
-                           ("realized", "Realized P/L"), ("unrealized", "Unrealized P/L")):
+                           ("realized", "Realized P/L"), ("unrealized", "Unrealized P/L"),
+                           ("zfree", "Zerodha free cash")):
             f, v = self._stat(stats, title)
             f.pack(side="left", fill="x", expand=True, padx=4)
             self.stat[key] = v
@@ -374,6 +376,10 @@ class App(ctk.CTk):
                 ("st", "Status", 85)]
         wrap, self.hold_tree = make_tree(top, cols, height=8)
         wrap.pack(fill="both", expand=True, padx=14, pady=(0, 12))
+        ctk.CTkLabel(top, text="Right-click a holding to set its S-level.", text_color=SUB,
+                     anchor="w").pack(fill="x", padx=14, pady=(0, 8))
+        self.hold_tree.bind("<Button-3>", self._hold_menu)
+        self.hold_tree.bind("<Button-2>", self._hold_menu)        # macOS trackpad
 
         bot = self._card(tab)
         bot.pack(fill="both", expand=True, pady=(8, 0), padx=4)
@@ -385,6 +391,44 @@ class App(ctk.CTk):
                 ("rsi", "RSI 14", 65), ("slv", "S-level", 65), ("state", "State", 130)]
         wrap, self.live_tree = make_tree(bot, cols, height=9)
         wrap.pack(fill="both", expand=True, padx=14, pady=(0, 12))
+
+    def _hold_menu(self, event):
+        sym = self.hold_tree.identify_row(event.y)
+        if not sym or sym.startswith("slot-"):
+            return
+        self.hold_tree.selection_set(sym)
+        menu = tk.Menu(self, tearoff=0, bg="#ffffff", fg=TEXT, activebackground=SELECT,
+                       activeforeground=TEXT)
+        menu.add_command(label=f"S-level for {sym}", state="disabled")
+        menu.add_separator()
+        menu.add_command(label="—  (none)", command=lambda: self._set_s_level(sym, ""))
+        for lv in config.S_LEVELS:
+            pct = config.SETTINGS["s_level_pct"][lv]
+            menu.add_command(label=f"{lv}  sell {pct:g}%",
+                             command=lambda lv=lv: self._set_s_level(sym, lv))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _set_s_level(self, sym, level):
+        items = watchlist.items()
+        item = next((w for w in items if w.symbol == sym), None)
+        if item is None:
+            messagebox.showinfo("S-level", f"{sym} is no longer in the watchlist. Add it back "
+                                           "(Watchlist tab) to set an S-level for it.")
+            return
+        if level:
+            pct = config.SETTINGS["s_level_pct"][level]
+            if not messagebox.askyesno(
+                    "S-level", f"Set {level} on {sym}?\n\nIt sells {pct:g}% of the holding "
+                               f"while it is at a loss or within "
+                               f"{config.SETTINGS['s_level_near_pct']:g}% of cost."):
+                return
+        item.s_level = level
+        watchlist.upsert(item)
+        self._refresh_watch_editor()
+        logger.warning("S-level for %s set to %s", sym, level or "none")
 
     # ------------------------------------------------------------ watchlist
     def _build_watchlist(self, tab):
@@ -971,10 +1015,32 @@ class App(ctk.CTk):
                                                "holdings. It can only be re-initialised when empty.")
             return
         per = cap * eq / 100 / n
+        cash_note = ""
+        if mode == "LIVE":
+            if not SESSION.logged_in:
+                messagebox.showerror("Initialise", "LIVE: log in first (Account tab) so the "
+                                                   "capital can be checked against your Zerodha cash.")
+                return
+            try:
+                zcash = funds.live_cash(SESSION.kite.margins("equity"))
+            except Exception as e:
+                messagebox.showerror("Initialise", f"Could not read your Zerodha funds: {e}")
+                return
+            if zcash is None:
+                messagebox.showerror("Initialise", "Zerodha did not return a cash balance.")
+                return
+            if cap > zcash:
+                messagebox.showerror(
+                    "Initialise", f"Capital ₹{cap:,.0f} is more than your Zerodha free cash "
+                                  f"₹{zcash:,.0f}.\n\nLower the initial investment to at most "
+                                  f"₹{zcash:,.0f} (or add funds in Zerodha).")
+                return
+            cash_note = f"Zerodha free cash ₹{zcash:,.0f} (OK)\n\n"
         if not messagebox.askyesno(
                 "Initialise portfolio",
                 f"{mode} book:\n\nCapital ₹{cap:,.0f}\n{n} slots x ₹{per:,.0f} = ₹{cap * eq / 100:,.0f} "
                 f"({eq:g}%)\nReserve ₹{cap * (100 - eq) / 100:,.0f}\n\n"
+                + cash_note
                 + ("This replaces the current empty book. " if old.initialised else "")
                 + "Continue?"):
             return
@@ -1088,6 +1154,8 @@ class App(ctk.CTk):
                 text_color=OK if s["feed"] else SUB)
             rs = s["recon_state"]
             rtxt = f"Zerodha sync: {rs}" + (f" @ {s['recon_time']}" if s["recon_time"] else "")
+            if s.get("zcash") is not None:
+                rtxt += f"   ·   Zerodha cash {s['zcash']:,.0f} @ {s['funds_time']}"
             self.lbl_recon.configure(text=rtxt, text_color=(WARN if rs.startswith("MISMATCH")
                                                             or rs == "CHECK FAILED" else
                                                             OK if rs == "OK" else SUB))
@@ -1110,11 +1178,20 @@ class App(ctk.CTk):
         for k in ("realized", "unrealized"):
             v = s[k]
             self.stat[k].configure(text=fmt_pnl(v), text_color=OK if v > 0 else WARN if v < 0 else TEXT)
+        if idle or s.get("mode") != "LIVE":
+            self.stat["zfree"].configure(text="paper" if s.get("mode") == "PAPER" and not idle
+                                         else "—", text_color=SUB)
+        else:
+            zf = s.get("zfree")
+            self.stat["zfree"].configure(
+                text=fmt(zf, 0) if zf is not None else s.get("funds_state", "—"),
+                text_color=(WARN if zf is not None and zf < 0 else TEXT) if zf is not None else WARN)
 
+        hsel = self.hold_tree.selection()
         self.hold_tree.delete(*self.hold_tree.get_children())
         for h in s["holdings"]:
             if not h["symbol"]:
-                self.hold_tree.insert("", "end", tags=("dim",), values=(
+                self.hold_tree.insert("", "end", iid=f"slot-{h['slot']}", tags=("dim",), values=(
                     h["slot"], "— free —", "", "", "", "", "", "", "", "", "", "", "", "",
                     fmt(h["cash"], 0), ""))
                 continue
@@ -1128,11 +1205,14 @@ class App(ctk.CTk):
             slv = h["s_level"] or "—"
             if h["s_done"]:
                 slv += f" (done {h['s_done']})"
-            self.hold_tree.insert("", "end", tags=((tag,) if tag else ()), values=(
+            self.hold_tree.insert("", "end", iid=h["symbol"], tags=((tag,) if tag else ()), values=(
                 h["slot"], h["symbol"], h["type"], h["qty"], fmt(h["avg"]), fmt(h["ltp"]),
                 fmt_pnl(h["pnl"]), fmt(h["pnl_pct"], 1), fmt(h["target"]), h["age"],
                 h["steps"], fmt(h["avg_trigger"], dash="max"), h["adds"], slv,
                 fmt(h["cash"], 0), status))
+        for x in hsel:
+            if self.hold_tree.exists(x):
+                self.hold_tree.selection_set(x)
 
         self.live_tree.delete(*self.live_tree.get_children())
         for i, w in enumerate(s["watch"]):

@@ -13,13 +13,17 @@ Every start (each trading day):
   4. LIVE: reconciliation with Zerodha holdings + today's CNC positions.
      A share where Zerodha has LESS than the book is frozen until the user
      chooses Sync to Zerodha or Keep book (Reconcile tab)
-  5. quotes, RSI, WebSocket -> management resumes
+  5. LIVE: Zerodha free cash (kite.margins, live_balance)
+  6. quotes, RSI, WebSocket -> management resumes
 
 While running:
   * every second, inside trading hours, kill switch off:
     portfolio.decide() -> orders (frozen shares are skipped)
   * every 2 s (LIVE): one kite.orders() call settles working orders
   * every `reconcile_seconds` (LIVE): holdings reconciliation again
+  * every 30 s and after each buy fill (LIVE): Zerodha free cash. A BUY or
+    ADD whose amount is more than the free cash is skipped (logged), so the
+    app never sends an order Zerodha would reject for funds
   * the book is saved after every fill; a fill whose Zerodha order id is
     already in the book is never applied twice
 
@@ -36,6 +40,7 @@ from typing import Dict
 from kiteconnect import KiteTicker
 
 import config
+import funds
 import instruments
 import portfolio as pf
 import reconcile as rc
@@ -111,6 +116,14 @@ class Engine:
         self._recon_lock = threading.Lock()
         self._last_recon = 0.0
         self.holdings_avg: Dict[str, float] = {}
+        # Zerodha funds
+        self.zcash = None                  # live_balance from kite.margins("equity")
+        self.funds_time = None
+        self.funds_state = "PAPER" if not self.live else "—"
+        self._recent_buys = []             # [(epoch, amount)] of our buy fills
+        self._last_funds = 0.0
+        self._funds_busy = threading.Event()
+        self._skip_logged: Dict[str, float] = {}
 
     # ==================================================================
     # control
@@ -166,11 +179,20 @@ class Engine:
                              name="rsi").start()
             if self.live:
                 self._reconcile(startup=True)
+                self._refresh_funds()
             logger.info("Start-up summary: %d holdings restored, %d journal order(s) recovered, "
-                        "%d still working, reconciliation %s%s",
+                        "%d still working, reconciliation %s%s%s",
                         len(self.book.holdings), recovered, self.orders.working_count(),
                         self.recon_state,
-                        f" (FROZEN: {', '.join(sorted(self.frozen))})" if self.frozen else "")
+                        f" (FROZEN: {', '.join(sorted(self.frozen))})" if self.frozen else "",
+                        f", Zerodha free cash {self.zcash:,.2f}" if self.zcash is not None else "")
+            if self.live and self.zcash is not None:
+                need = self.book.slot_cash + max(0.0, self.book.reserve)
+                if self.zcash < need:
+                    logger.warning("Zerodha free cash %.0f is less than the book's unspent cash "
+                                   "%.0f (slots %.0f + reserve %.0f). Buys are checked against "
+                                   "Zerodha's cash and skipped when it is short.",
+                                   self.zcash, need, self.book.slot_cash, self.book.reserve)
             self._connect_feed()
             self._set_status("RUNNING")
 
@@ -439,6 +461,57 @@ class Engine:
         return self.book.holdings[sym].avg, "average cost"
 
     # ==================================================================
+    # Zerodha funds
+    # ==================================================================
+    def _refresh_funds(self):
+        if not self.live or self._funds_busy.is_set():
+            return
+        self._funds_busy.set()
+        try:
+            cash = funds.live_cash(SESSION.kite.margins("equity"))
+            if cash is None:
+                raise RuntimeError("no live_balance in margins response")
+            self.zcash = cash
+            self.funds_time = config.now_ist().strftime("%H:%M:%S")
+            self.funds_state = "OK"
+        except Exception as e:
+            self.funds_state = "CHECK FAILED"
+            logger.warning("Zerodha funds: could not read margins: %s", e)
+        finally:
+            self._last_funds = time.time()
+            self._funds_busy.clear()
+
+    def refresh_funds_async(self):
+        threading.Thread(target=self._refresh_funds, daemon=True, name="funds").start()
+
+    def free_cash(self):
+        if not self.live:
+            return None
+        now = time.time()
+        self._recent_buys = [(t, a) for t, a in self._recent_buys if now - t <= 300]
+        return funds.free_cash(self.zcash, self.orders.committed_buy_amount() if self.orders else 0.0,
+                               self._recent_buys, now=now)
+
+    def _affordable(self, a) -> bool:
+        """LIVE: a BUY / ADD only goes out if Zerodha has the cash."""
+        if not self.live or a["kind"] not in ("BUY", "ADD"):
+            return True
+        free = self.free_cash()
+        if free is None:
+            return True                    # unknown: Zerodha's own check still applies
+        s = config.SETTINGS
+        need = funds.buy_amount(a, float(s.get("market_buffer_pct", 0.5)),
+                                s["entry_order_type"] == "MARKET")
+        if need <= free:
+            return True
+        key = f"{a['kind']}:{a['symbol']}"
+        if time.time() - self._skip_logged.get(key, 0) > 300:
+            self._skip_logged[key] = time.time()
+            logger.warning("SKIPPED %s %s x%d (₹%.0f): Zerodha free cash only ₹%.0f",
+                           a["kind"], a["symbol"], a["qty"], need, free)
+        return False
+
+    # ==================================================================
     # WebSocket (QUOTE mode: LTP + day OHLC)
     # ==================================================================
     def _connect_feed(self):
@@ -536,6 +609,9 @@ class Engine:
             if time.time() - self._last_recon > every:
                 self._last_recon = time.time()
                 self.reconcile_now()
+            if time.time() - self._last_funds > 30:
+                self._last_funds = time.time()
+                self.refresh_funds_async()
 
         if kill:
             self.status = "KILLED"
@@ -553,7 +629,8 @@ class Engine:
                                  ticks=self.ticksize,
                                  busy_slots=self.orders.busy_slots())
                 for a in acts:
-                    self.orders.submit(a, self.ticksize.get(a["symbol"], 0.05))
+                    if self._affordable(a):
+                        self.orders.submit(a, self.ticksize.get(a["symbol"], 0.05))
 
     def _on_fill(self, action, qty, price, order_id=""):
         today = config.now_ist().date()
@@ -589,6 +666,10 @@ class Engine:
                     h.s_done = action["level"]
             self.book.mark_applied(order_id)
             save_book(self.mode, self.book)
+            if self.live and kind in ("BUY", "ADD"):
+                self._recent_buys.append((time.time(), qty * price))
+            if self.live:
+                self.refresh_funds_async()
             logger.info("FILL %s %s x%d @ %.2f%s | reserve %.0f, slot cash %.0f",
                         kind, sym, qty, price,
                         f" | P/L {pnl:+,.2f}" if pnl != "" else "",
@@ -679,6 +760,8 @@ class Engine:
                 "recon_state": self.recon_state, "recon_time": self.recon_time,
                 "recon": [dict(r) for r in self.recon_rows], "frozen": sorted(self.frozen),
                 "working": self.orders.working_count() if self.orders else 0,
+                "zcash": self.zcash, "zfree": self.free_cash() if self.orders else None,
+                "funds_state": self.funds_state, "funds_time": self.funds_time,
                 "capital": self.book.capital, "reserve": self.book.reserve,
                 "slot_cash": self.book.slot_cash, "invested": self.book.invested(),
                 "value": self.book.market_value(ltps), "realized": self.book.realized,

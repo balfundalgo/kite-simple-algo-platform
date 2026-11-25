@@ -177,6 +177,18 @@ class OrderManager:
         with self.lock:
             return any(w.action["kind"] == "ADD" for w in self.working.values())
 
+    def committed_buy_amount(self) -> float:
+        """Rupees held by our BUY / ADD orders still working (unfilled part)."""
+        buf = 1 + float(config.SETTINGS.get("market_buffer_pct", 0.5)) / 100.0
+        total = 0.0
+        with self.lock:
+            for w in self.working.values():
+                if w.txn != "BUY":
+                    continue
+                px = w.price if w.price else float(w.action["price"]) * buf
+                total += max(0, w.qty - w.filled) * px
+        return total
+
     def working_count(self) -> int:
         with self.lock:
             return len(self.working)

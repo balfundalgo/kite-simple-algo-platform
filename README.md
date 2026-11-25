@@ -25,6 +25,21 @@ Index futures are parked for now: the 40% reserve is used only for averaging dow
 | S-levels | S1–S5 on a share sells that % of the holding, only while it is at a loss or within 1% above cost. Fires once per level set. | 20 / 40 / 60 / 80 / 100% |
 | Kill switch | No orders at all; working orders cancelled. Holdings are **not** sold. Survives restarts. | header button |
 
+## Zerodha cash (LIVE)
+
+* Free cash comes from `kite.margins("equity")` → `available.live_balance` (cash only;
+  pledged collateral cannot pay for delivery buys). Shown on the dashboard, refreshed every
+  30 s and after each fill.
+* **Initialise portfolio** in LIVE needs a login and refuses capital above Zerodha's free cash.
+* Before every BUY / ADD the app checks: free cash = live_balance − money held by working buy
+  orders − its own buy fills of the last 5 minutes (Zerodha's balance lags). A buy that does
+  not fit is skipped and logged, not sent.
+
+## S-levels
+
+Set per share at any time: Watchlist tab (select the row, pick the S-level, Add / Update), or
+right-click a holding on the Dashboard. Takes effect on the next second.
+
 ## Stock search
 
 The Watchlist tab has a type-ahead search over the full NSE share list (downloaded from Kite
@@ -82,6 +97,7 @@ LIVE orders need the static IP registered on the Kite app.
 |---|---|
 | `src/portfolio.py` | All rules and the money book, pure Python |
 | `src/reconcile.py` | Book vs Zerodha quantities, pure Python |
+| `src/funds.py` | Zerodha free cash for buys, pure Python |
 | `src/engine.py` | Start-up recovery, loop, fills, reconciliation, book persistence |
 | `src/broker.py` | Kite session, PAPER/LIVE orders, write-ahead order journal |
 | `src/instruments.py` | NSE share list cache and ranked search |

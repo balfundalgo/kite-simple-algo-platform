@@ -18,7 +18,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 APP_NAME = "Balfund Simple Algo Platform"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 BROKER = "Zerodha"
 
 IST = ZoneInfo("Asia/Kolkata")

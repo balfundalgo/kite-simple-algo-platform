@@ -20,6 +20,7 @@ import config  # noqa: E402
 import portfolio as pf  # noqa: E402
 import instruments  # noqa: E402
 import reconcile as rc  # noqa: E402
+import funds  # noqa: E402
 from indicators import rsi  # noqa: E402
 from watchlist import resolve, rows_to_items  # noqa: E402
 
@@ -329,6 +330,20 @@ b2 = pf.Book.from_dict(b.to_dict())
 check("applied ids persisted", b2.was_applied("X1") and b2.recon_kept == {"A": 5})
 old = pf.Book.from_dict({"capital": 1, "slots": [{"id": 1, "cash": 1}]})
 check("old book files still load", old.applied_orders == [] and old.recon_kept == {})
+
+# ---------------------------------------------------------------- Zerodha funds
+m = {"enabled": True, "net": 160000.0,
+     "available": {"cash": 100000.0, "live_balance": 95000.0, "collateral": 60000.0}}
+check("live_balance used (not net with collateral)", funds.live_cash(m) == 95000.0)
+check("falls back to cash", funds.live_cash({"available": {"cash": 5000}}) == 5000.0)
+check("no margins -> None", funds.live_cash({}) is None)
+now = 1_000_000.0
+check("free = live - committed", funds.free_cash(95000, 20000, [], now=now) == 75000)
+check("recent buy fills held back", funds.free_cash(95000, 0, [(now - 60, 30000)], now=now) == 65000)
+check("old buy fills already in live_balance", funds.free_cash(95000, 0, [(now - 400, 30000)], now=now) == 95000)
+check("unknown balance -> None", funds.free_cash(None, 0, [], now=now) is None)
+check("LIMIT buy amount", funds.buy_amount({"qty": 100, "price": 50.0}, 0.5, False) == 5000)
+check("MARKET buy amount with buffer", near(funds.buy_amount({"qty": 100, "price": 50.0}, 0.5, True), 5025))
 
 print(f"\n{PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)
