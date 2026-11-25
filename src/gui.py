@@ -1,11 +1,11 @@
 """
 gui.py
 ======
-Dashboard for the Balfund Simple Algo Platform.
+Light-theme desktop app for the Balfund Simple Algo Platform.
 
-Tabs: Dashboard (book, slots, live watchlist, NIFTY), Watchlist (edit the
-shares that replace the Excel sheet), Orders, Account (Kite login),
-Settings (rules + Initialise portfolio), Log.
+Tabs: Dashboard (book, slots, live watchlist, NIFTY), Watchlist (type-ahead
+stock search + the rules per share), Orders, Reconcile (book vs Zerodha,
+Sync / Keep for frozen shares), Account (Kite login), Settings, Log.
 
 The engine runs on its own threads; the GUI only reads snapshots and log
 lines from queues every 300 ms. When the engine is not running the book
@@ -20,6 +20,7 @@ from tkinter import filedialog, messagebox, ttk
 import customtkinter as ctk
 
 import config
+import instruments
 import logger as logmod
 import portfolio as pf
 import watchlist
@@ -27,18 +28,23 @@ from broker import SESSION
 from engine import Engine, book_path, load_book, save_book
 from logger import logger
 
-BG = "#0f1115"
-CARD = "#171a21"
-CARD2 = "#1d212a"
-TEXT = "#e6e8ec"
-SUB = "#8b93a3"
-ACCENT = "#4f8cff"
-OK = "#2ecc71"
-WARN = "#ff5c5c"
-AMBER = "#f5a623"
-MUTED = "#3a4050"
+# ---------------------------------------------------------------- light palette
+BG = "#f3f5f9"
+CARD = "#ffffff"
+CARD2 = "#ffffff"
+LINE = "#e3e7ee"
+TEXT = "#1f2937"
+SUB = "#6b7280"
+ACCENT = "#2563eb"
+OK = "#16a34a"
+WARN = "#dc2626"
+AMBER = "#d97706"
+MUTED = "#e5e7eb"
+MUTED_HOVER = "#d1d5db"
+HEAD = "#eef2f7"
+SELECT = "#dbeafe"
 
-ctk.set_appearance_mode("dark")
+ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
 
 
@@ -50,19 +56,33 @@ def fmt_pnl(x):
     return f"{x:+,.2f}" if isinstance(x, (int, float)) else "—"
 
 
+def button(parent, text, command, kind="primary", width=110):
+    colors = {
+        "primary": (ACCENT, "#1d4ed8", "#ffffff"),
+        "muted": (MUTED, MUTED_HOVER, TEXT),
+        "ok": (OK, "#15803d", "#ffffff"),
+        "warn": (WARN, "#b91c1c", "#ffffff"),
+        "amber": (AMBER, "#b45309", "#ffffff"),
+    }[kind]
+    return ctk.CTkButton(parent, text=text, command=command, width=width, fg_color=colors[0],
+                         hover_color=colors[1], text_color=colors[2],
+                         text_color_disabled="#9ca3af")
+
+
 def make_tree(parent, cols, height=8):
     wrap = tk.Frame(parent, bg=CARD)
     tree = ttk.Treeview(wrap, columns=[c[0] for c in cols], show="headings",
-                        height=height, style="Dark.Treeview")
+                        height=height, style="Light.Treeview")
     for c, t, w in cols:
         tree.heading(c, text=t)
         tree.column(c, width=w, anchor="center")
-    tree.tag_configure("profit", foreground="#7ee2a8")
-    tree.tag_configure("loss", foreground="#ff9a9a")
-    tree.tag_configure("busy", foreground="#ffe0a3")
-    tree.tag_configure("dim", foreground="#5d6577")
-    tree.tag_configure("ready", foreground="#c7dbff")
-    tree.tag_configure("bad", foreground=WARN)
+    tree.tag_configure("profit", foreground="#15803d")
+    tree.tag_configure("loss", foreground="#b91c1c")
+    tree.tag_configure("busy", foreground="#b45309")
+    tree.tag_configure("dim", foreground="#9ca3af")
+    tree.tag_configure("ready", foreground="#1d4ed8")
+    tree.tag_configure("bad", foreground="#ffffff", background="#ef4444")
+    tree.tag_configure("odd", background="#f9fafb")
     sb = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
     tree.configure(yscrollcommand=sb.set)
     tree.pack(side="left", fill="both", expand=True)
@@ -70,6 +90,145 @@ def make_tree(parent, cols, height=8):
     return wrap, tree
 
 
+# ======================================================================
+# type-ahead stock search
+# ======================================================================
+class SearchBox(ctk.CTkFrame):
+    """
+    Entry with a drop-down of matching NSE shares (symbol or company name).
+    Arrow keys + Enter or mouse click pick a share; only picked / exact
+    listed symbols are accepted by symbol().
+    """
+    MAX_ROWS = 12
+
+    def __init__(self, master, on_pick, width=320):
+        super().__init__(master, fg_color="transparent")
+        self.on_pick = on_pick
+        self.var = tk.StringVar()
+        self.entry = ctk.CTkEntry(self, textvariable=self.var, width=width,
+                                  placeholder_text="Type symbol or company name…")
+        self.entry.pack(side="left")
+        self.results = []
+        self.selected = None
+        self.lb = None
+        self.entry.bind("<KeyRelease>", self._on_key)
+        self.entry.bind("<Down>", self._to_list)
+        self.entry.bind("<Return>", self._enter)
+        self.entry.bind("<Escape>", lambda e: self.hide())
+        self.entry.bind("<FocusOut>", lambda e: self.after(200, self._maybe_hide))
+
+    # -- public --------------------------------------------------------------
+    def symbol(self):
+        """The chosen NSE symbol, or None if the text is not a listed share."""
+        if self.selected:
+            return self.selected["tradingsymbol"]
+        txt = self.var.get().strip().upper().split(" ")[0] if self.var.get().strip() else ""
+        return txt if txt and instruments.get(txt) else None
+
+    def set_symbol(self, sym):
+        row = instruments.get(sym)
+        self.selected = row
+        self.var.set(sym)
+        self.hide()
+
+    def clear(self):
+        self.selected = None
+        self.var.set("")
+        self.hide()
+
+    # -- internals -------------------------------------------------------------
+    def _on_key(self, e):
+        if e.keysym in ("Up", "Down", "Return", "Escape", "Tab", "Shift_L", "Shift_R"):
+            return
+        self.selected = None
+        q = self.var.get()
+        self.results = instruments.search(q, 30) if q.strip() else []
+        if q.strip() and not instruments.count():
+            self.results = []
+            self._show(["Stock list not loaded yet — log in once (Account tab)"], info=True)
+            return
+        if q.strip() and not self.results:
+            self._show(["No NSE share matches"], info=True)
+            return
+        self._show([f"{r['tradingsymbol']:<14} {r['name']}" for r in self.results])
+
+    def _show(self, lines, info=False):
+        if not lines:
+            self.hide()
+            return
+        top = self.winfo_toplevel()
+        if self.lb is None:
+            self.lb = tk.Listbox(top, font=("Consolas", 11), activestyle="none",
+                                 bg="#ffffff", fg=TEXT, selectbackground=SELECT,
+                                 selectforeground=TEXT, relief="solid", bd=1,
+                                 highlightthickness=0, exportselection=False)
+            self.lb.bind("<ButtonRelease-1>", lambda e: self._pick_selected())
+            self.lb.bind("<Return>", lambda e: self._pick_selected())
+            self.lb.bind("<Escape>", lambda e: (self.hide(), self.entry.focus_set()))
+            self.lb.bind("<Up>", self._list_up)
+            self.lb.bind("<FocusOut>", lambda e: self.after(200, self._maybe_hide))
+        self._info = info
+        self.lb.delete(0, "end")
+        for ln in lines:
+            self.lb.insert("end", ln)
+        self.lb.configure(height=min(len(lines), self.MAX_ROWS),
+                          fg=SUB if info else TEXT)
+        top.update_idletasks()
+        x = self.entry.winfo_rootx() - top.winfo_rootx()
+        y = self.entry.winfo_rooty() - top.winfo_rooty() + self.entry.winfo_height() + 2
+        self.lb.place(x=x, y=y, width=max(self.entry.winfo_width(), 460))
+        self.lb.lift()
+
+    def hide(self):
+        if self.lb is not None:
+            self.lb.place_forget()
+
+    def _maybe_hide(self):
+        f = self.focus_get()
+        if f is not self.lb:
+            self.hide()
+
+    def _to_list(self, e=None):
+        if self.lb is not None and self.lb.winfo_ismapped() and self.results:
+            self.lb.focus_set()
+            self.lb.selection_clear(0, "end")
+            self.lb.selection_set(0)
+            self.lb.activate(0)
+        return "break"
+
+    def _list_up(self, e=None):
+        sel = self.lb.curselection()
+        if sel and sel[0] == 0:
+            self.entry.focus_set()
+            return "break"
+
+    def _enter(self, e=None):
+        if not self.results:
+            return "break"
+        q = self.var.get().strip().upper()
+        exact = next((r for r in self.results if r["tradingsymbol"] == q), None)
+        self._pick(exact or self.results[0])
+        return "break"
+
+    def _pick_selected(self):
+        if getattr(self, "_info", False):
+            return
+        sel = self.lb.curselection()
+        if sel and sel[0] < len(self.results):
+            self._pick(self.results[sel[0]])
+
+    def _pick(self, row):
+        self.selected = row
+        self.var.set(row["tradingsymbol"])
+        self.hide()
+        self.entry.focus_set()
+        self.entry.icursor("end")
+        self.on_pick(row)
+
+
+# ======================================================================
+# app
+# ======================================================================
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -86,11 +245,16 @@ class App(ctk.CTk):
 
         self._style_tree()
         self._build_header()
-        self.tabs = ctk.CTkTabview(self, fg_color=BG, segmented_button_selected_color=ACCENT)
+        self.tabs = ctk.CTkTabview(self, fg_color=BG, segmented_button_selected_color=ACCENT,
+                                   segmented_button_fg_color=MUTED,
+                                   segmented_button_unselected_color=MUTED,
+                                   segmented_button_unselected_hover_color=MUTED_HOVER,
+                                   text_color=TEXT)
         self.tabs.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         self._build_dashboard(self.tabs.add("Dashboard"))
         self._build_watchlist(self.tabs.add("Watchlist"))
         self._build_orders(self.tabs.add("Orders"))
+        self._build_reconcile(self.tabs.add("Reconcile"))
         self._build_account(self.tabs.add("Account"))
         self._build_settings(self.tabs.add("Settings"))
         self._build_log(self.tabs.add("Log"))
@@ -103,20 +267,28 @@ class App(ctk.CTk):
         self.after(500, self._idle_refresh)
         logger.info("%s v%s ready. Mode: %s", config.APP_NAME, config.APP_VERSION,
                     config.SETTINGS["mode"])
+        if instruments.count():
+            logger.info("Stock list: %d NSE shares (from %s)", instruments.count(),
+                        instruments.cache_date())
+        else:
+            threading.Thread(target=self._public_instruments, daemon=True).start()
 
     # ------------------------------------------------------------ styling
     def _style_tree(self):
         st = ttk.Style()
         st.theme_use("default")
-        st.configure("Dark.Treeview", background=CARD2, fieldbackground=CARD2,
-                     foreground=TEXT, rowheight=22, borderwidth=0, font=("Segoe UI", 10))
-        st.configure("Dark.Treeview.Heading", background=CARD, foreground=SUB,
+        st.configure("Light.Treeview", background=CARD2, fieldbackground=CARD2,
+                     foreground=TEXT, rowheight=24, borderwidth=0, font=("Segoe UI", 10))
+        st.configure("Light.Treeview.Heading", background=HEAD, foreground=SUB,
                      relief="flat", font=("Segoe UI", 10, "bold"))
-        st.map("Dark.Treeview", background=[("selected", "#2b3550")])
+        st.map("Light.Treeview", background=[("selected", SELECT)],
+               foreground=[("selected", TEXT)])
+        st.map("Light.Treeview.Heading", background=[("active", LINE)])
 
     # ------------------------------------------------------------ header
     def _build_header(self):
-        h = ctk.CTkFrame(self, fg_color=CARD, corner_radius=0, height=64)
+        h = ctk.CTkFrame(self, fg_color=CARD, corner_radius=0, height=64,
+                         border_width=1, border_color=LINE)
         h.pack(fill="x")
         left = ctk.CTkFrame(h, fg_color="transparent")
         left.pack(side="left", padx=16, pady=10)
@@ -133,22 +305,23 @@ class App(ctk.CTk):
 
         right = ctk.CTkFrame(h, fg_color="transparent")
         right.pack(side="right", padx=16)
-        self.lbl_clock = ctk.CTkLabel(right, text="", font=ctk.CTkFont(size=18, weight="bold"))
+        self.lbl_clock = ctk.CTkLabel(right, text="", text_color=TEXT,
+                                      font=ctk.CTkFont(size=18, weight="bold"))
         self.lbl_clock.pack(side="right", padx=(14, 0))
-        self.btn_kill = ctk.CTkButton(right, text="", width=170, command=self._toggle_kill)
+        self.btn_kill = button(right, "", self._toggle_kill, "muted", 170)
         self.btn_kill.pack(side="right", padx=4)
-        self.btn_stop = ctk.CTkButton(right, text="Stop", width=80, fg_color=MUTED,
-                                      state="disabled", command=self._stop)
+        self.btn_stop = button(right, "Stop", self._stop, "muted", 80)
+        self.btn_stop.configure(state="disabled")
         self.btn_stop.pack(side="right", padx=4)
-        self.btn_start = ctk.CTkButton(right, text="Start", width=90, fg_color=OK,
-                                       hover_color="#27ae60", text_color="#0b1a10",
-                                       command=self._start)
+        self.btn_start = button(right, "Start", self._start, "ok", 90)
         self.btn_start.pack(side="right", padx=4)
 
         strip = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
-        strip.pack(fill="x", padx=16, pady=(4, 0))
+        strip.pack(fill="x", padx=16, pady=(6, 0))
         self.lbl_feed = ctk.CTkLabel(strip, text="WS: offline", text_color=SUB, anchor="w")
         self.lbl_feed.pack(side="left")
+        self.lbl_recon = ctk.CTkLabel(strip, text="", text_color=SUB, anchor="w")
+        self.lbl_recon.pack(side="left", padx=24)
         self.lbl_nifty = ctk.CTkLabel(strip, text="NIFTY 50: —", text_color=TEXT, anchor="e")
         self.lbl_nifty.pack(side="right")
         self._paint_mode()
@@ -157,17 +330,22 @@ class App(ctk.CTk):
     def _paint_mode(self):
         m = config.SETTINGS["mode"]
         self.lbl_mode.configure(text=f" {m} ", fg_color=WARN if m == "LIVE" else AMBER,
-                                text_color="#111")
+                                text_color="#ffffff")
 
     def _paint_kill(self):
         on = bool(config.SETTINGS.get("kill_switch"))
         self.btn_kill.configure(
             text="KILL SWITCH: ON" if on else "KILL SWITCH: off",
-            fg_color=WARN if on else MUTED, hover_color="#d84343" if on else "#4a5163")
+            fg_color=WARN if on else MUTED, hover_color="#b91c1c" if on else MUTED_HOVER,
+            text_color="#ffffff" if on else TEXT)
 
     # ------------------------------------------------------------ dashboard
+    def _card(self, parent, **kw):
+        return ctk.CTkFrame(parent, fg_color=CARD, corner_radius=12, border_width=1,
+                            border_color=LINE, **kw)
+
     def _stat(self, parent, title):
-        f = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=12)
+        f = self._card(parent)
         ctk.CTkLabel(f, text=title, text_color=SUB).pack(anchor="w", padx=14, pady=(10, 0))
         v = ctk.CTkLabel(f, text="—", font=ctk.CTkFont(size=20, weight="bold"), text_color=TEXT)
         v.pack(anchor="w", padx=14, pady=(0, 10))
@@ -184,19 +362,20 @@ class App(ctk.CTk):
             f.pack(side="left", fill="x", expand=True, padx=4)
             self.stat[key] = v
 
-        top = ctk.CTkFrame(tab, fg_color=CARD, corner_radius=12)
+        top = self._card(tab)
         top.pack(fill="both", expand=True, padx=4)
         ctk.CTkLabel(top, text="Slots & holdings", text_color=SUB, anchor="w").pack(
             fill="x", padx=14, pady=(8, 2))
-        cols = [("slot", "Slot", 45), ("symbol", "Share", 120), ("type", "Type", 110),
-                ("qty", "Qty", 70), ("avg", "Avg cost", 90), ("ltp", "LTP", 90),
-                ("pnl", "P/L", 100), ("pct", "P/L %", 70), ("target", "Target", 90),
-                ("age", "Age (d)", 65), ("steps", "Aged x", 60), ("trig", "Avg-down at", 95),
-                ("adds", "Adds", 50), ("slv", "S-level", 75), ("cash", "Slot cash", 100)]
+        cols = [("slot", "Slot", 45), ("symbol", "Share", 115), ("type", "Type", 110),
+                ("qty", "Qty", 65), ("avg", "Avg cost", 85), ("ltp", "LTP", 85),
+                ("pnl", "P/L", 95), ("pct", "P/L %", 65), ("target", "Target", 85),
+                ("age", "Age (d)", 60), ("steps", "Aged x", 55), ("trig", "Avg-down at", 90),
+                ("adds", "Adds", 45), ("slv", "S-level", 75), ("cash", "Slot cash", 90),
+                ("st", "Status", 85)]
         wrap, self.hold_tree = make_tree(top, cols, height=8)
         wrap.pack(fill="both", expand=True, padx=14, pady=(0, 12))
 
-        bot = ctk.CTkFrame(tab, fg_color=CARD, corner_radius=12)
+        bot = self._card(tab)
         bot.pack(fill="both", expand=True, pady=(8, 0), padx=4)
         ctk.CTkLabel(bot, text="Watchlist (live)", text_color=SUB, anchor="w").pack(
             fill="x", padx=14, pady=(8, 2))
@@ -209,67 +388,98 @@ class App(ctk.CTk):
 
     # ------------------------------------------------------------ watchlist
     def _build_watchlist(self, tab):
-        box = ctk.CTkFrame(tab, fg_color=CARD, corner_radius=12)
-        box.pack(fill="both", expand=True, pady=4)
-        ctk.CTkLabel(box, text="Shares in priority order. A free slot buys the first one whose "
-                               "price reaches its buy price. Edits apply on the next second, "
-                               "no restart needed.",
-                     text_color=SUB, anchor="w").pack(fill="x", padx=14, pady=(10, 4))
-        cols = [("n", "#", 40), ("symbol", "NSE symbol", 130), ("name", "Name (sheet)", 220),
-                ("buy", "Buy price", 100), ("type", "Market type", 130),
-                ("slv", "S-level", 80), ("en", "Enabled", 80)]
-        wrap, self.wl_tree = make_tree(box, cols, height=14)
-        wrap.pack(fill="both", expand=True, padx=14, pady=4)
-        self.wl_tree.bind("<<TreeviewSelect>>", self._wl_select)
-
-        form = ctk.CTkFrame(tab, fg_color=CARD, corner_radius=12)
-        form.pack(fill="x", pady=8)
-        self.wl_vars = {"symbol": tk.StringVar(), "name": tk.StringVar(),
-                        "buy": tk.StringVar(), "type": tk.StringVar(value="BULL"),
-                        "slv": tk.StringVar(value="—"), "en": tk.BooleanVar(value=True)}
+        form = self._card(tab)
+        form.pack(fill="x", pady=(4, 8))
+        self.wl_vars = {"name": tk.StringVar(), "buy": tk.StringVar(),
+                        "type": tk.StringVar(value="BULL"), "slv": tk.StringVar(value="—"),
+                        "en": tk.BooleanVar(value=True)}
         self._wl_editing = None
+
         row = ctk.CTkFrame(form, fg_color="transparent")
-        row.pack(fill="x", padx=14, pady=(12, 4))
-        for label, key, w in (("NSE symbol", "symbol", 130), ("Name", "name", 200),
-                              ("Buy price", "buy", 100)):
-            ctk.CTkLabel(row, text=label, text_color=SUB).pack(side="left", padx=(0, 6))
-            ctk.CTkEntry(row, textvariable=self.wl_vars[key], width=w).pack(side="left", padx=(0, 14))
-        ctk.CTkLabel(row, text="Market type", text_color=SUB).pack(side="left", padx=(0, 6))
-        ctk.CTkOptionMenu(row, variable=self.wl_vars["type"], values=list(config.MARKET_TYPES),
-                          width=150).pack(side="left", padx=(0, 14))
-        ctk.CTkLabel(row, text="S-level", text_color=SUB).pack(side="left", padx=(0, 6))
-        ctk.CTkOptionMenu(row, variable=self.wl_vars["slv"], values=["—"] + list(config.S_LEVELS),
-                          width=80).pack(side="left", padx=(0, 14))
-        ctk.CTkCheckBox(row, text="Enabled", variable=self.wl_vars["en"]).pack(side="left")
+        row.pack(fill="x", padx=14, pady=(14, 4))
+        ctk.CTkLabel(row, text="Search share", text_color=SUB).pack(side="left", padx=(0, 8))
+        self.search = SearchBox(row, self._on_search_pick, width=320)
+        self.search.pack(side="left")
+        self.lbl_pick = ctk.CTkLabel(row, text="", text_color=TEXT, anchor="w",
+                                     font=ctk.CTkFont(size=13, weight="bold"))
+        self.lbl_pick.pack(side="left", padx=14)
+        self.lbl_count = ctk.CTkLabel(row, text="", text_color=SUB, anchor="e")
+        self.lbl_count.pack(side="right")
+
+        row2 = ctk.CTkFrame(form, fg_color="transparent")
+        row2.pack(fill="x", padx=14, pady=(6, 4))
+        ctk.CTkLabel(row2, text="Buy price", text_color=SUB).pack(side="left", padx=(0, 6))
+        ctk.CTkEntry(row2, textvariable=self.wl_vars["buy"], width=110).pack(side="left", padx=(0, 16))
+        ctk.CTkLabel(row2, text="Market type", text_color=SUB).pack(side="left", padx=(0, 6))
+        ctk.CTkOptionMenu(row2, variable=self.wl_vars["type"], values=list(config.MARKET_TYPES),
+                          width=160).pack(side="left", padx=(0, 16))
+        ctk.CTkLabel(row2, text="S-level", text_color=SUB).pack(side="left", padx=(0, 6))
+        ctk.CTkOptionMenu(row2, variable=self.wl_vars["slv"], values=["—"] + list(config.S_LEVELS),
+                          width=80).pack(side="left", padx=(0, 16))
+        ctk.CTkCheckBox(row2, text="Enabled", variable=self.wl_vars["en"],
+                        text_color=TEXT).pack(side="left")
 
         btns = ctk.CTkFrame(form, fg_color="transparent")
-        btns.pack(fill="x", padx=14, pady=(4, 12))
-        ctk.CTkButton(btns, text="Add / Update", width=120, command=self._wl_save).pack(side="left", padx=4)
-        ctk.CTkButton(btns, text="New", width=70, fg_color=MUTED, command=self._wl_clear).pack(side="left", padx=4)
-        ctk.CTkButton(btns, text="Remove", width=90, fg_color=MUTED, command=self._wl_remove).pack(side="left", padx=4)
-        ctk.CTkButton(btns, text="▲", width=40, fg_color=MUTED,
-                      command=lambda: self._wl_move(-1)).pack(side="left", padx=(16, 2))
-        ctk.CTkButton(btns, text="▼", width=40, fg_color=MUTED,
-                      command=lambda: self._wl_move(1)).pack(side="left", padx=2)
-        ctk.CTkButton(btns, text="Import Excel / CSV", width=150,
-                      command=self._wl_import).pack(side="left", padx=(24, 4))
-        ctk.CTkButton(btns, text="Export", width=80, fg_color=MUTED,
-                      command=self._wl_export).pack(side="left", padx=4)
-        ctk.CTkButton(btns, text="Resolve NSE symbols", width=160, fg_color=MUTED,
-                      command=self._wl_resolve).pack(side="left", padx=4)
+        btns.pack(fill="x", padx=14, pady=(8, 14))
+        button(btns, "Add / Update", self._wl_save, "primary", 120).pack(side="left", padx=4)
+        button(btns, "New", self._wl_clear, "muted", 70).pack(side="left", padx=4)
+        button(btns, "Remove", self._wl_remove, "muted", 90).pack(side="left", padx=4)
+        button(btns, "▲", lambda: self._wl_move(-1), "muted", 40).pack(side="left", padx=(16, 2))
+        button(btns, "▼", lambda: self._wl_move(1), "muted", 40).pack(side="left", padx=2)
+        button(btns, "Import Excel / CSV", self._wl_import, "primary", 150).pack(side="left", padx=(24, 4))
+        button(btns, "Export", self._wl_export, "muted", 80).pack(side="left", padx=4)
+        button(btns, "Update stock list", self._wl_refresh_list, "muted", 140).pack(side="left", padx=4)
         self.slv_all = tk.StringVar(value="—")
         ctk.CTkLabel(btns, text="   S-level for all:", text_color=SUB).pack(side="left")
         ctk.CTkOptionMenu(btns, variable=self.slv_all, values=["—"] + list(config.S_LEVELS),
                           width=80).pack(side="left", padx=4)
-        ctk.CTkButton(btns, text="Apply", width=70, fg_color=AMBER, text_color="#111",
-                      command=self._wl_slv_all).pack(side="left", padx=4)
+        button(btns, "Apply", self._wl_slv_all, "amber", 70).pack(side="left", padx=4)
+
+        box = self._card(tab)
+        box.pack(fill="both", expand=True)
+        ctk.CTkLabel(box, text="Shares in priority order. A free slot buys the first one whose "
+                               "price reaches its buy price. Red rows are not NSE shares: select "
+                               "the row and pick the right share in the search box.",
+                     text_color=SUB, anchor="w").pack(fill="x", padx=14, pady=(10, 4))
+        cols = [("n", "#", 40), ("symbol", "NSE symbol", 130), ("name", "Company", 260),
+                ("buy", "Buy price", 100), ("type", "Market type", 130),
+                ("slv", "S-level", 80), ("en", "Enabled", 80)]
+        wrap, self.wl_tree = make_tree(box, cols, height=14)
+        wrap.pack(fill="both", expand=True, padx=14, pady=(4, 12))
+        self.wl_tree.bind("<<TreeviewSelect>>", self._wl_select)
+
+    def _on_search_pick(self, row):
+        self.wl_vars["name"].set(row["name"])
+        self.lbl_pick.configure(text=f"{row['tradingsymbol']} · {row['name']}")
+        if SESSION.logged_in:
+            sym = row["tradingsymbol"]
+
+            def work():
+                try:
+                    ltp = SESSION.kite.ltp([f"NSE:{sym}"])[f"NSE:{sym}"]["last_price"]
+                    self.after(0, lambda: self.lbl_pick.configure(
+                        text=f"{sym} · {row['name']} · LTP {ltp:,.2f}"))
+                    if not self.wl_vars["buy"].get().strip():
+                        self.after(0, lambda: self.wl_vars["buy"].set(f"{ltp:g}"))
+                except Exception:
+                    pass
+            threading.Thread(target=work, daemon=True).start()
 
     def _refresh_watch_editor(self):
+        idx = instruments.index()
         self.wl_tree.delete(*self.wl_tree.get_children())
         for i, w in enumerate(watchlist.items(), 1):
-            self.wl_tree.insert("", "end", iid=w.symbol, tags=(() if w.enabled else ("dim",)),
-                                values=(i, w.symbol, w.name, fmt(w.buy_price), w.market_type,
+            bad = bool(idx) and w.symbol not in idx
+            tags = ("bad",) if bad else (("dim",) if not w.enabled else (("odd",) if i % 2 == 0 else ()))
+            name = (idx.get(w.symbol) or {}).get("name") or w.name
+            if bad:
+                name = f"NOT FOUND ({w.name or w.symbol}) — pick with search"
+            self.wl_tree.insert("", "end", iid=w.symbol, tags=tags,
+                                values=(i, w.symbol, name, fmt(w.buy_price), w.market_type,
                                         w.s_level or "—", "yes" if w.enabled else "no"))
+        self.lbl_count.configure(
+            text=(f"Stock list: {instruments.count():,} NSE shares ({instruments.cache_date()})"
+                  if instruments.count() else "Stock list not loaded — log in once"))
 
     def _wl_select(self, _=None):
         sel = self.wl_tree.selection()
@@ -278,7 +488,16 @@ class App(ctk.CTk):
         for w in watchlist.items():
             if w.symbol == sel[0]:
                 self._wl_editing = w.symbol
-                self.wl_vars["symbol"].set(w.symbol)
+                row = instruments.get(w.symbol)
+                if row:
+                    self.search.set_symbol(w.symbol)
+                    self.lbl_pick.configure(text=f"{w.symbol} · {row['name']}")
+                else:
+                    self.search.clear()
+                    self.search.var.set(w.name or w.symbol)
+                    self.lbl_pick.configure(text="not an NSE share — pick from the list",
+                                            text_color=WARN)
+                    self.after(2500, lambda: self.lbl_pick.configure(text_color=TEXT))
                 self.wl_vars["name"].set(w.name)
                 self.wl_vars["buy"].set(f"{w.buy_price:g}")
                 self.wl_vars["type"].set(w.market_type)
@@ -287,17 +506,24 @@ class App(ctk.CTk):
 
     def _wl_clear(self):
         self._wl_editing = None
-        for k in ("symbol", "name", "buy"):
-            self.wl_vars[k].set("")
+        self.search.clear()
+        self.lbl_pick.configure(text="")
+        self.wl_vars["name"].set("")
+        self.wl_vars["buy"].set("")
         self.wl_vars["type"].set("BULL")
         self.wl_vars["slv"].set("—")
         self.wl_vars["en"].set(True)
         self.wl_tree.selection_remove(self.wl_tree.selection())
 
     def _wl_save(self):
-        sym = watchlist.symbolize(self.wl_vars["symbol"].get())
+        if not instruments.count():
+            messagebox.showerror("Watchlist", "The NSE stock list is not loaded yet. Log in once "
+                                              "on the Account tab; it is then kept on this PC.")
+            return
+        sym = self.search.symbol()
         if not sym:
-            messagebox.showerror("Watchlist", "NSE symbol is required")
+            messagebox.showerror("Watchlist", "Pick a share from the search list "
+                                              "(type part of the symbol or company name).")
             return
         try:
             buy = float(self.wl_vars["buy"].get())
@@ -312,10 +538,12 @@ class App(ctk.CTk):
         slv = self.wl_vars["slv"].get()
         item = pf.WatchItem(symbol=sym, buy_price=buy, market_type=self.wl_vars["type"].get(),
                             s_level="" if slv == "—" else slv, enabled=bool(self.wl_vars["en"].get()),
-                            name=self.wl_vars["name"].get().strip() or sym)
+                            name=instruments.get(sym)["name"] or sym)
         watchlist.upsert(item, old_symbol=self._wl_editing)
         self._wl_editing = sym
         self._refresh_watch_editor()
+        if self.wl_tree.exists(sym):
+            self.wl_tree.selection_set(sym)
         logger.info("Watchlist: %s saved (buy %.2f, %s, S-level %s)", sym, buy,
                     item.market_type, item.s_level or "none")
 
@@ -365,12 +593,21 @@ class App(ctk.CTk):
                 by[w.symbol] = w
             merged = list(by.values())
         watchlist.save(merged)
-        if SESSION.logged_in:
-            self._wl_resolve(quiet=True)
-        self._refresh_watch_editor()
         logger.info("Imported %d shares from %s", len(new), path)
         for n in notes:
             logger.warning("Import: %s", n)
+        self._resolve_watchlist()
+
+    def _resolve_watchlist(self):
+        idx = instruments.index()
+        if idx:
+            changed, missing = watchlist.resolve_all(idx)
+            for old, new in changed:
+                logger.info("Matched %s -> %s (%s)", old, new, idx[new]["name"])
+            for m in missing:
+                logger.error("Not found on NSE: %s — select the red row and pick the share "
+                             "with the search box", m)
+        self._refresh_watch_editor()
 
     def _wl_export(self):
         path = filedialog.asksaveasfilename(defaultextension=".xlsx",
@@ -379,25 +616,26 @@ class App(ctk.CTk):
             watchlist.export_file(path)
             logger.info("Watchlist exported to %s", path)
 
-    def _wl_resolve(self, quiet=False):
-        if not SESSION.logged_in:
-            messagebox.showinfo("Resolve", "Log in on the Account tab first")
-            return
-
+    def _wl_refresh_list(self):
         def work():
             try:
-                idx = watchlist.build_index(SESSION.kite.instruments("NSE"))
-                changed, missing = watchlist.resolve_all(idx)
-                for old, new in changed:
-                    logger.info("Resolved %s -> %s", old, new)
-                for m in missing:
-                    logger.error("Not found on NSE: %s (type the NSE symbol yourself)", m)
-                if not changed and not missing:
-                    logger.info("All watchlist symbols are valid NSE symbols")
+                if SESSION.logged_in:
+                    n = instruments.refresh(SESSION.kite, force=True)
+                else:
+                    n = instruments.refresh_public(config.SETTINGS["account"].get("api_key", ""))
+                logger.info("Stock list updated: %d NSE shares", n)
             except Exception as e:
-                logger.error("Resolve failed: %s", e)
-            self.after(0, self._refresh_watch_editor)
+                logger.error("Stock list download failed: %s", e)
+            self.after(0, self._resolve_watchlist)
         threading.Thread(target=work, daemon=True).start()
+
+    def _public_instruments(self):
+        try:
+            n = instruments.refresh_public(config.SETTINGS["account"].get("api_key", ""))
+            logger.info("Stock list downloaded: %d NSE shares", n)
+            self.after(0, self._resolve_watchlist)
+        except Exception as e:
+            logger.info("Stock list will be downloaded after login (%s)", e)
 
     def _wl_slv_all(self):
         lvl = self.slv_all.get()
@@ -411,21 +649,95 @@ class App(ctk.CTk):
 
     # ------------------------------------------------------------ orders
     def _build_orders(self, tab):
-        box = ctk.CTkFrame(tab, fg_color=CARD, corner_radius=12)
+        box = self._card(tab)
         box.pack(fill="both", expand=True, pady=4)
-        ctk.CTkLabel(box, text="Orders this session (all are also in logs/orders_<date>.csv; "
-                               "fills in logs/trades_<date>.csv)",
+        ctk.CTkLabel(box, text="Orders this session, including any recovered from the journal at "
+                               "start (also in logs/orders_<date>.csv; fills in logs/trades_<date>.csv)",
                      text_color=SUB, anchor="w").pack(fill="x", padx=14, pady=(10, 4))
         cols = [("time", "Time", 75), ("kind", "Kind", 110), ("symbol", "Share", 120),
                 ("txn", "Side", 60), ("type", "Type", 75), ("qty", "Qty", 70),
-                ("price", "Price", 90), ("oid", "Order id", 160), ("status", "Status", 110),
+                ("price", "Price", 90), ("oid", "Order id", 160), ("status", "Status", 120),
                 ("filled", "Filled", 65), ("avg", "Avg", 90), ("msg", "Message", 300)]
         wrap, self.ord_tree = make_tree(box, cols, height=25)
         wrap.pack(fill="both", expand=True, padx=14, pady=(0, 12))
 
+    # ------------------------------------------------------------ reconcile
+    def _build_reconcile(self, tab):
+        box = self._card(tab)
+        box.pack(fill="both", expand=True, pady=4)
+        ctk.CTkLabel(box, text="Book vs Zerodha (holdings + today's CNC positions), checked at "
+                               "every start and every few seconds while running in LIVE.",
+                     text_color=SUB, anchor="w").pack(fill="x", padx=14, pady=(12, 2))
+        ctk.CTkLabel(box, text="OK = match · EXTRA = Zerodha holds more (your own shares, not "
+                               "managed) · MISMATCH = Zerodha holds LESS than the book: the share "
+                               "is FROZEN (no orders) until you choose:",
+                     text_color=SUB, anchor="w").pack(fill="x", padx=14, pady=(0, 2))
+        ctk.CTkLabel(box, text="   Sync to Zerodha — the book takes Zerodha's quantity; the "
+                               "shortfall is booked as sold (today's sell price, else LTP). "
+                               "If nothing is left, the slot is freed.\n"
+                               "   Keep book — you confirm the book is right for this Zerodha "
+                               "quantity (e.g. shares pledged/moved); trading resumes and it "
+                               "re-freezes if Zerodha's quantity changes again.",
+                     text_color=TEXT, anchor="w", justify="left").pack(fill="x", padx=14, pady=(0, 8))
+        top = ctk.CTkFrame(box, fg_color="transparent")
+        top.pack(fill="x", padx=14, pady=(0, 6))
+        self.lbl_recon_big = ctk.CTkLabel(top, text="Not checked yet (Start in LIVE mode)",
+                                          text_color=TEXT, font=ctk.CTkFont(size=15, weight="bold"))
+        self.lbl_recon_big.pack(side="left")
+        button(top, "Keep book", self._recon_keep, "muted", 110).pack(side="right", padx=4)
+        button(top, "Sync to Zerodha", self._recon_sync, "amber", 150).pack(side="right", padx=4)
+        button(top, "Check now", self._recon_check, "primary", 110).pack(side="right", padx=4)
+        cols = [("symbol", "Share", 160), ("book", "Book qty", 120), ("zerodha", "Zerodha qty", 120),
+                ("diff", "Difference", 120), ("state", "State", 140)]
+        wrap, self.recon_tree = make_tree(box, cols, height=16)
+        wrap.pack(fill="both", expand=True, padx=14, pady=(0, 12))
+
+    def _engine_live(self):
+        if not (self.engine and self.engine.running and self.engine.live):
+            messagebox.showinfo("Reconcile", "Reconciliation runs while the engine is running in LIVE mode.")
+            return False
+        return True
+
+    def _recon_check(self):
+        if self._engine_live():
+            self.engine.reconcile_now()
+
+    def _recon_selected(self):
+        sel = self.recon_tree.selection()
+        if not sel:
+            messagebox.showinfo("Reconcile", "Select a share first")
+            return None
+        return sel[0]
+
+    def _recon_sync(self):
+        if not self._engine_live():
+            return
+        sym = self._recon_selected()
+        if not sym:
+            return
+        row = next((r for r in (self.snap or {}).get("recon", []) if r["symbol"] == sym), None)
+        if row and row["zerodha"] >= row["book"]:
+            messagebox.showinfo("Reconcile", f"{sym} is already in line with Zerodha")
+            return
+        if messagebox.askyesno("Sync to Zerodha",
+                               f"{sym}: set the book to Zerodha's quantity"
+                               + (f" ({row['zerodha']}, book {row['book']})" if row else "")
+                               + "?\n\nThe shortfall is booked as sold."):
+            threading.Thread(target=self.engine.recon_sync, args=(sym,), daemon=True).start()
+
+    def _recon_keep(self):
+        if not self._engine_live():
+            return
+        sym = self._recon_selected()
+        if sym and messagebox.askyesno(
+                "Keep book", f"Keep the book quantity for {sym} although Zerodha shows less?\n\n"
+                             "Orders for it resume. Sell orders may be rejected by Zerodha if "
+                             "the shares are really not there."):
+            self.engine.recon_keep(sym)
+
     # ------------------------------------------------------------ account
     def _build_account(self, tab):
-        form = ctk.CTkFrame(tab, fg_color=CARD, corner_radius=12)
+        form = self._card(tab)
         form.pack(fill="x", pady=4)
         acct = config.SETTINGS["account"]
         self.acc_vars = {"api_key": tk.StringVar(value=acct.get("api_key", "")),
@@ -439,11 +751,9 @@ class App(ctk.CTk):
                 side="left", padx=(0, 14))
         btns = ctk.CTkFrame(form, fg_color="transparent")
         btns.pack(fill="x", padx=14, pady=(6, 6))
-        ctk.CTkButton(btns, text="Save", width=90, command=self._acc_save).pack(side="left", padx=4)
-        ctk.CTkButton(btns, text="Login", width=100, fg_color=OK, text_color="#0b1a10",
-                      command=lambda: self._acc_login(False)).pack(side="left", padx=(24, 4))
-        ctk.CTkButton(btns, text="Force fresh login", width=140, fg_color=MUTED,
-                      command=lambda: self._acc_login(True)).pack(side="left", padx=4)
+        button(btns, "Save", self._acc_save, "primary", 90).pack(side="left", padx=4)
+        button(btns, "Login", lambda: self._acc_login(False), "ok", 100).pack(side="left", padx=(24, 4))
+        button(btns, "Force fresh login", lambda: self._acc_login(True), "muted", 140).pack(side="left", padx=4)
         self.lbl_acc = ctk.CTkLabel(form, text="not logged in", text_color=SUB, anchor="w",
                                     font=ctk.CTkFont(size=14, weight="bold"))
         self.lbl_acc.pack(fill="x", padx=14, pady=(8, 4))
@@ -477,6 +787,12 @@ class App(ctk.CTk):
         def work():
             try:
                 SESSION.login(force=force)
+                try:
+                    n = instruments.refresh(SESSION.kite)
+                    logger.info("Stock list: %d NSE shares (%s)", n, instruments.cache_date())
+                except Exception as e:
+                    logger.warning("Stock list download failed: %s", e)
+                self.after(0, self._resolve_watchlist)
             except Exception:
                 pass
             self.after(0, self._refresh_account)
@@ -484,7 +800,8 @@ class App(ctk.CTk):
 
     # ------------------------------------------------------------ settings
     def _build_settings(self, tab):
-        box = ctk.CTkScrollableFrame(tab, fg_color=CARD, corner_radius=12)
+        box = ctk.CTkScrollableFrame(tab, fg_color=CARD, corner_radius=12, border_width=1,
+                                     border_color=LINE)
         box.pack(fill="both", expand=True, pady=4)
         self.set_vars = {}
 
@@ -535,8 +852,7 @@ class App(ctk.CTk):
               options=[str(i) for i in range(1, 21)])
         r = ctk.CTkFrame(box, fg_color="transparent")
         r.pack(fill="x", padx=16, pady=(6, 3))
-        ctk.CTkButton(r, text="Initialise portfolio", width=180, fg_color=AMBER, text_color="#111",
-                      command=self._init_book).pack(side="left")
+        button(r, "Initialise portfolio", self._init_book, "amber", 180).pack(side="left")
         self.lbl_book = ctk.CTkLabel(r, text="", text_color=SUB, anchor="w")
         self.lbl_book.pack(side="left", padx=12)
 
@@ -572,6 +888,9 @@ class App(ctk.CTk):
         field("Cancel unfilled LIMIT after (s)", "limit_order_timeout_s", kind="int")
         field("Market protection", "market_protection", "-1 = Kite automatic, 1–100 = %", kind="int")
 
+        section("Zerodha reconciliation (LIVE)")
+        field("Check holdings every (s)", "reconcile_seconds", "minimum 15", kind="int")
+
         section("Timing (IST)")
         field("Trading start (HH:MM)", "trade_start", kind="time")
         field("Trading end (HH:MM)", "trade_end", kind="time")
@@ -581,7 +900,7 @@ class App(ctk.CTk):
         field("Redirect host", "redirect_host", kind="str")
         field("Redirect port", "redirect_port", kind="int")
 
-        ctk.CTkButton(box, text="Save settings", width=160, command=self._save_settings).pack(
+        button(box, "Save settings", self._save_settings, "primary", 160).pack(
             anchor="w", padx=16, pady=16)
         self._paint_book_label()
 
@@ -669,7 +988,8 @@ class App(ctk.CTk):
 
     # ------------------------------------------------------------ log
     def _build_log(self, tab):
-        self.txt = ctk.CTkTextbox(tab, fg_color=CARD, font=ctk.CTkFont(family="Consolas", size=12))
+        self.txt = ctk.CTkTextbox(tab, fg_color=CARD, text_color=TEXT, border_width=1,
+                                  border_color=LINE, font=ctk.CTkFont(family="Consolas", size=12))
         self.txt.pack(fill="both", expand=True, pady=4)
         ctk.CTkLabel(tab, text=f"Logs folder: {config.LOG_DIR}   ·   State folder: {config.STATE_DIR}",
                      text_color=SUB, anchor="w").pack(fill="x", pady=(4, 0))
@@ -714,7 +1034,8 @@ class App(ctk.CTk):
 
     def _on_close(self):
         if self.engine and self.engine.running:
-            if not messagebox.askyesno("Exit", "Engine is running. Exit anyway?"):
+            if not messagebox.askyesno("Exit", "Engine is running. Exit anyway?\n\nThe book is "
+                                               "saved; working orders are settled on the next start."):
                 return
             self.engine.stop()
         self.destroy()
@@ -757,14 +1078,22 @@ class App(ctk.CTk):
     def _render(self, s, idle=False):
         st = "IDLE" if idle else s["status"]
         color = {"RUNNING": OK, "KILLED": WARN, "ERROR": WARN, "MARKET CLOSED": ACCENT,
-                 "STOPPED": MUTED, "IDLE": MUTED}.get(st, AMBER)
-        self.lbl_status.configure(text=f" {st} ", fg_color=color, text_color="#111")
+                 "STOPPED": "#9ca3af", "IDLE": "#9ca3af"}.get(st, AMBER)
+        self.lbl_status.configure(text=f" {st} ", fg_color=color, text_color="#ffffff")
         self._paint_kill()
         if not idle:
             self.lbl_feed.configure(
-                text=f"WS: {'live' if s['feed'] else 'offline'} · {s['ticks']:,} ticks   |   "
-                     f"Broker check: {s['broker_check']}",
-                text_color=(WARN if s["broker_check"] == "MISMATCH" else OK if s["feed"] else SUB))
+                text=f"WS: {'live' if s['feed'] else 'offline'} · {s['ticks']:,} ticks · "
+                     f"working orders {s['working']}",
+                text_color=OK if s["feed"] else SUB)
+            rs = s["recon_state"]
+            rtxt = f"Zerodha sync: {rs}" + (f" @ {s['recon_time']}" if s["recon_time"] else "")
+            self.lbl_recon.configure(text=rtxt, text_color=(WARN if rs.startswith("MISMATCH")
+                                                            or rs == "CHECK FAILED" else
+                                                            OK if rs == "OK" else SUB))
+            self.lbl_recon_big.configure(text=rtxt + (f"   ·   FROZEN: {', '.join(s['frozen'])}"
+                                                      if s["frozen"] else ""),
+                                         text_color=WARN if s["frozen"] else TEXT)
             n = s.get("nifty") or {}
             if n.get("ltp"):
                 self.lbl_nifty.configure(
@@ -787,22 +1116,28 @@ class App(ctk.CTk):
             if not h["symbol"]:
                 self.hold_tree.insert("", "end", tags=("dim",), values=(
                     h["slot"], "— free —", "", "", "", "", "", "", "", "", "", "", "", "",
-                    fmt(h["cash"], 0)))
+                    fmt(h["cash"], 0), ""))
                 continue
-            tag = "busy" if h["busy"] else ("profit" if (h["pnl"] or 0) > 0 else
-                                            "loss" if (h["pnl"] or 0) < 0 else "")
+            if h["frozen"]:
+                tag, status = "bad", "FROZEN"
+            elif h["busy"]:
+                tag, status = "busy", "ORDER"
+            else:
+                tag = "profit" if (h["pnl"] or 0) > 0 else "loss" if (h["pnl"] or 0) < 0 else ""
+                status = "managed"
             slv = h["s_level"] or "—"
             if h["s_done"]:
                 slv += f" (done {h['s_done']})"
-            self.hold_tree.insert("", "end", tags=(tag,), values=(
+            self.hold_tree.insert("", "end", tags=((tag,) if tag else ()), values=(
                 h["slot"], h["symbol"], h["type"], h["qty"], fmt(h["avg"]), fmt(h["ltp"]),
                 fmt_pnl(h["pnl"]), fmt(h["pnl_pct"], 1), fmt(h["target"]), h["age"],
-                h["steps"], fmt(h["avg_trigger"], dash="max"), h["adds"], slv, fmt(h["cash"], 0)))
+                h["steps"], fmt(h["avg_trigger"], dash="max"), h["adds"], slv,
+                fmt(h["cash"], 0), status))
 
         self.live_tree.delete(*self.live_tree.get_children())
-        for w in s["watch"]:
+        for i, w in enumerate(s["watch"]):
             tag = {"HELD": "profit", "READY": "ready", "ORDER": "busy", "OFF": "dim",
-                   "NOT FOUND": "bad"}.get(w["state"], "")
+                   "NOT FOUND": "bad", "FROZEN": "bad"}.get(w["state"], "odd" if i % 2 else "")
             self.live_tree.insert("", "end", tags=((tag,) if tag else ()), values=(
                 w["symbol"], fmt(w["buy"]), w["type"], fmt(w["ltp"]), fmt(w["dist"], 1),
                 fmt(w["open"]), fmt(w["high"]), fmt(w["low"]), fmt(w["prev"]),
@@ -817,6 +1152,18 @@ class App(ctk.CTk):
                     o["time"], o["kind"], o["symbol"], o["txn"], o["type"], o["qty"],
                     fmt(o["price"], dash="MKT"), o["order_id"], o["status"], o["filled"],
                     fmt(o["avg"]), o["msg"][:80]))
+
+            sel = self.recon_tree.selection()
+            self.recon_tree.delete(*self.recon_tree.get_children())
+            for r in s["recon"]:
+                tag = {"MISMATCH": "bad", "OK": "profit", "EXTRA": "ready", "KEPT": "busy",
+                       "BUSY": "dim", "CHECKING": "busy"}.get(r["state"], "")
+                self.recon_tree.insert("", "end", iid=r["symbol"], tags=((tag,) if tag else ()),
+                                       values=(r["symbol"], r["book"], r["zerodha"],
+                                               f"{r['diff']:+d}", r["state"]))
+            for x in sel:
+                if self.recon_tree.exists(x):
+                    self.recon_tree.selection_set(x)
 
 
 def run():

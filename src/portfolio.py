@@ -121,6 +121,8 @@ class Book:
     holdings: Dict[str, Holding] = field(default_factory=dict)
     realized: float = 0.0
     created: str = ""
+    applied_orders: List[str] = field(default_factory=list)   # Zerodha ids already in the book
+    recon_kept: Dict[str, int] = field(default_factory=dict)  # "Keep book" choices
 
     # -- persistence --------------------------------------------------------
     def to_dict(self) -> dict:
@@ -129,6 +131,8 @@ class Book:
             "reserve": self.reserve, "realized": self.realized, "created": self.created,
             "slots": [asdict(s) for s in self.slots],
             "holdings": {k: asdict(h) for k, h in self.holdings.items()},
+            "applied_orders": self.applied_orders[-1000:],
+            "recon_kept": self.recon_kept,
         }
 
     @classmethod
@@ -138,7 +142,18 @@ class Book:
                 created=d.get("created", ""))
         b.slots = [Slot(**s) for s in d.get("slots", [])]
         b.holdings = {k: Holding(**h) for k, h in d.get("holdings", {}).items()}
+        b.applied_orders = list(d.get("applied_orders", []))
+        b.recon_kept = {k: int(v) for k, v in d.get("recon_kept", {}).items()}
         return b
+
+    def was_applied(self, order_id: str) -> bool:
+        return bool(order_id) and order_id in self.applied_orders
+
+    def mark_applied(self, order_id: str) -> None:
+        if order_id and order_id not in self.applied_orders:
+            self.applied_orders.append(order_id)
+            if len(self.applied_orders) > 1000:
+                self.applied_orders = self.applied_orders[-1000:]
 
     # -- views --------------------------------------------------------------
     @property

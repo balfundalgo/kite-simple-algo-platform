@@ -18,7 +18,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 APP_NAME = "Balfund Simple Algo Platform"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 BROKER = "Zerodha"
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -89,6 +89,9 @@ DEFAULT_SETTINGS = {
     # orders
     "limit_order_timeout_s": 60,         # unfilled LIMIT orders are cancelled after this
     "market_protection": -1,             # -1 = Kite auto market protection
+
+    # Zerodha reconciliation (LIVE)
+    "reconcile_seconds": 60,             # holdings vs book check interval
 
     # kill switch (persisted, survives restarts)
     "kill_switch": False,

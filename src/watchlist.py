@@ -209,14 +209,8 @@ def export_file(path: str) -> None:
 
 
 # ----------------------------------------------------------------------
-# symbol resolution against the Kite NSE instrument list
+# symbol resolution against the NSE list (instruments.index())
 # ----------------------------------------------------------------------
-def build_index(instruments: List[dict]) -> Dict[str, dict]:
-    """tradingsymbol -> row, NSE cash equities only."""
-    return {r["tradingsymbol"]: r for r in instruments
-            if r.get("segment") == "NSE" and r.get("instrument_type") == "EQ"}
-
-
 def resolve(item: WatchItem, index: Dict[str, dict]) -> Optional[str]:
     if item.symbol in index:
         return item.symbol
@@ -233,6 +227,10 @@ def resolve(item: WatchItem, index: Dict[str, dict]) -> Optional[str]:
     starts = [s for n, s in names.items() if n.startswith(wanted + " ") or n.startswith(wanted)]
     if len(starts) == 1:
         return starts[0]
+    # Kite truncates long company names: "WELSPUN CORP" for WELSPUN CORPORATION
+    trunc = [s for n, s in names.items() if len(n) >= 6 and wanted.startswith(n)]
+    if len(trunc) == 1:
+        return trunc[0]
     sq = symbolize(wanted)
     if sq in index:
         return sq

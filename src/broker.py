@@ -6,23 +6,30 @@ Kite session and order handling for NSE cash shares (CNC delivery).
 PAPER: every order fills at once at its price; nothing goes to Zerodha.
 LIVE : orders go to Zerodha and are tracked until they are final.
 
+Crash safety (multi-day holding):
+  * WRITE-AHEAD JOURNAL. Every LIVE order is written to
+    state/orders_live.json (with its unique tag) BEFORE it is sent, and
+    removed only after its fill is in the book. If the app or PC dies at any
+    moment, the next start finds the order again in Zerodha's order book by
+    id or tag and settles it: filled -> into the book, open -> tracked,
+    rejected/cancelled -> dropped.
+  * Tags carry the date and time (BF + MMDDHHMMSS + seq), unique across days.
+  * One kite.orders() call per poll covers every working order; the book is
+    changed only by a confirmed fill, and the engine skips any order id it has
+    already applied (no double counting).
+
 Lessons carried over from the Gaurav / POMR builds:
-  * UNKNOWN is not FAILED. An order whose state cannot be read (timeout,
-    network error) stays WORKING and is polled again; the book is only
-    changed by a confirmed fill. A slot is never freed on a guess.
-  * place_order() that raises a network error may still have reached the
-    exchange, so every order carries a unique tag and the order book is
-    searched for that tag before declaring it not placed.
+  * UNKNOWN is not FAILED: an order whose state cannot be read stays working.
+  * A network error on place_order() may still have reached Zerodha: the order
+    book is searched for the tag before declaring it not placed.
   * Partial fills are applied for exactly the filled quantity.
-  * All broker calls run on one worker thread so the engine never blocks
-    and orders stay in sequence.
 """
 
 import itertools
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
@@ -30,7 +37,7 @@ import config
 import kite_auth
 from logger import logger, order_row
 
-TAG_PREFIX = "BFSAP"
+TAG_PREFIX = "BF"
 FINAL = ("COMPLETE", "REJECTED", "CANCELLED")
 SELL_KINDS = ("SELL_TARGET", "SELL_SLEVEL")
 
@@ -81,6 +88,7 @@ class WorkingOrder:
     price: Optional[float]
     tag: str
     placed_at: float = field(default_factory=time.time)
+    day: str = field(default_factory=lambda: config.now_ist().date().isoformat())
     order_id: Optional[str] = None
     status: str = "SENDING"
     filled: int = 0
@@ -95,13 +103,17 @@ def _round_tick(x, tick=0.05):
     return round(round(x / tick) * tick, 2)
 
 
+def journal_path(mode: str):
+    return config.STATE_DIR / f"orders_{mode.lower()}.json"
+
+
 class OrderManager:
     """
-    on_fill(action, qty, avg_price) is called once per confirmed fill
-    (once per order, with the total filled quantity).
+    on_fill(action, qty, avg_price, order_id) is called once per order with
+    the total confirmed filled quantity.
     """
 
-    def __init__(self, live: bool, on_fill: Callable, kite=None):
+    def __init__(self, live: bool, on_fill: Callable, kite=None, mode: str = "PAPER"):
         self.live = live
         self.kite = kite
         self.on_fill = on_fill
@@ -110,8 +122,46 @@ class OrderManager:
         self.working: Dict[int, WorkingOrder] = {}
         self.history: List[WorkingOrder] = []
         self._seq = itertools.count(1)
-        self._run_id = datetime.now().strftime("%H%M%S")
         self._poll_pending = threading.Event()
+        self.journal_file = journal_path(mode)
+        self.last_orders: List[dict] = []          # last kite.orders() result
+
+    # -- journal ------------------------------------------------------------
+    def _journal_save(self):
+        if not self.live:
+            return
+        with self.lock:
+            rows = [asdict(w) for w in self.working.values()]
+        config.atomic_write_json(self.journal_file, rows)
+
+    def load_journal(self) -> List[WorkingOrder]:
+        """Orders that were working when the app last stopped."""
+        import json
+        if not self.journal_file.exists():
+            return []
+        try:
+            rows = json.loads(self.journal_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.error("Order journal unreadable (%s): %s", self.journal_file.name, e)
+            return []
+        out = []
+        for r in rows:
+            try:
+                out.append(WorkingOrder(**r))
+            except TypeError:
+                logger.error("Journal entry skipped: %s", r)
+        return out
+
+    def adopt(self, orders: List[WorkingOrder]) -> None:
+        """Put recovered journal orders back under tracking."""
+        with self.lock:
+            top = max([w.seq for w in orders] + [0])
+            self._seq = itertools.count(top + 1000)
+            for w in orders:
+                w.done = False
+                self.working[w.seq] = w
+                self.history.append(w)
+        self._journal_save()
 
     # -- state the engine asks about ------------------------------------
     def busy_symbols(self) -> set:
@@ -127,6 +177,10 @@ class OrderManager:
         with self.lock:
             return any(w.action["kind"] == "ADD" for w in self.working.values())
 
+    def working_count(self) -> int:
+        with self.lock:
+            return len(self.working)
+
     def orders_view(self) -> List[dict]:
         with self.lock:
             rows = list(self.history)
@@ -136,28 +190,28 @@ class OrderManager:
                  "avg": w.avg_price, "msg": w.message} for w in reversed(rows)]
 
     # -- submit -------------------------------------------------------------
+    def _new_tag(self, seq: int) -> str:
+        return f"{TAG_PREFIX}{config.now_ist().strftime('%m%d%H%M%S')}{seq % 10000:04d}"[:20]
+
     def submit(self, action: dict, tick: float = 0.05) -> None:
         s = config.SETTINGS
         kind = action["kind"]
         txn = "SELL" if kind in SELL_KINDS else "BUY"
         otype = s["exit_order_type"] if txn == "SELL" else s["entry_order_type"]
-        if kind == "ADD":
-            otype = s["entry_order_type"]
         price = None if otype == "MARKET" else _round_tick(float(action["price"]), tick)
         seq = next(self._seq)
         w = WorkingOrder(seq=seq, action=action, txn=txn, order_type=otype,
-                         qty=int(action["qty"]), price=price,
-                         tag=f"{TAG_PREFIX}{self._run_id}{seq:04d}"[:20])
+                         qty=int(action["qty"]), price=price, tag=self._new_tag(seq))
         with self.lock:
             self.working[seq] = w
             self.history.append(w)
-        logger.info("ORDER %s %s %s x%d %s%s  | %s", kind, txn, action["symbol"], w.qty, otype,
-                    f" @ {price:.2f}" if price else "", action.get("reason", ""))
+        logger.info("ORDER %s %s %s x%d %s%s  | %s  [tag %s]", kind, txn, action["symbol"], w.qty,
+                    otype, f" @ {price:.2f}" if price else "", action.get("reason", ""), w.tag)
         if not self.live:
-            fill_px = float(action["price"])
-            w.order_id = f"PAPER-{seq}"
-            self._final(w, "COMPLETE", w.qty, fill_px, "paper fill")
+            w.order_id = f"PAPER-{w.tag}"
+            self._final(w, "COMPLETE", w.qty, float(action["price"]), "paper fill")
             return
+        self._journal_save()                       # write-ahead: before it is sent
         self.pool.submit(self._live_place, w)
 
     # -- live ---------------------------------------------------------------
@@ -175,21 +229,30 @@ class OrderManager:
                 p["market_protection"] = int(mp)
         return p
 
-    def _find_by_tag(self, tag: str) -> Optional[str]:
+    def _fetch_orders(self) -> Optional[List[dict]]:
         try:
-            for o in self.kite.orders() or []:
-                if o.get("tag") == tag or tag in (o.get("tags") or []):
-                    return o.get("order_id")
+            rows = self.kite.orders() or []
+            self.last_orders = rows
+            return rows
         except Exception as e:
-            logger.warning("orders() while searching tag %s: %s", tag, e)
-            return "UNKNOWN"
-        return None
+            logger.warning("orders(): %s", e)
+            return None
+
+    @staticmethod
+    def _match(w: WorkingOrder, rows: List[dict]) -> Optional[dict]:
+        hit = None
+        for o in rows:
+            if (w.order_id and o.get("order_id") == w.order_id) or \
+                    o.get("tag") == w.tag or w.tag in (o.get("tags") or []):
+                hit = o                       # orders() lists updates oldest first
+        return hit
 
     def _live_place(self, w: WorkingOrder):
         from kiteconnect import exceptions as kex
         try:
             w.order_id = self.kite.place_order(**self._params(w))
             w.status = "OPEN"
+            self._journal_save()
             self._log(w, "PLACED")
         except (kex.InputException, kex.OrderException, kex.TokenException,
                 kex.PermissionException) as e:
@@ -197,16 +260,19 @@ class OrderManager:
         except Exception as e:
             # network / timeout: it may have reached Zerodha
             time.sleep(1.5)
-            oid = self._find_by_tag(w.tag)
-            if oid and oid != "UNKNOWN":
-                w.order_id = oid
+            rows = self._fetch_orders()
+            o = self._match(w, rows) if rows is not None else None
+            if o:
+                w.order_id = o.get("order_id")
                 w.status = "OPEN"
-                self._log(w, f"PLACED (recovered by tag after: {e})")
-            elif oid is None:
+                self._journal_save()
+                self._log(w, f"PLACED (found by tag after: {e})")
+            elif rows is not None:
                 self._final(w, "REJECTED", 0, None, f"not placed: {e}")
             else:
                 w.status = "UNKNOWN"
                 w.message = f"place uncertain: {e}"
+                self._journal_save()
                 self._log(w, "UNKNOWN")
                 logger.error("%s %s: order state UNKNOWN (tag %s). Kept working; "
                              "it will be checked again.", w.txn, w.action["symbol"], w.tag)
@@ -221,35 +287,39 @@ class OrderManager:
         self._poll_pending.set()
         self.pool.submit(self._poll)
 
-    def _poll(self):
+    def sync_now(self) -> None:
+        """Blocking settle of every working order (used at start-up)."""
+        if self.live:
+            self._poll(startup=True)
+
+    def _poll(self, startup: bool = False):
         try:
+            rows = self._fetch_orders()
+            if rows is None:
+                return                                   # unknown != failed
             with self.lock:
                 todo = list(self.working.values())
             timeout = float(config.SETTINGS.get("limit_order_timeout_s", 60))
+            today = config.now_ist().date().isoformat()
             for w in todo:
-                if w.order_id is None:
-                    if w.status == "UNKNOWN":
-                        oid = self._find_by_tag(w.tag)
-                        if oid and oid != "UNKNOWN":
-                            w.order_id = oid
-                            w.status = "OPEN"
-                        elif oid is None and time.time() - w.placed_at > 30:
-                            self._final(w, "REJECTED", 0, None, "never reached Zerodha")
+                o = self._match(w, rows)
+                if o is None:
+                    if w.day != today:
+                        # a previous day's order: not in today's order book.
+                        # The engine settles it against holdings.
+                        if startup:
+                            w.status = "PREVIOUS DAY"
+                        continue
+                    if w.order_id is None and time.time() - w.placed_at > 30:
+                        self._final(w, "REJECTED", 0, None, "never reached Zerodha")
                     continue
-                try:
-                    hist = self.kite.order_history(w.order_id)
-                except Exception as e:
-                    w.message = f"history: {e}"
-                    continue                    # unknown != failed, try next poll
-                if not hist:
-                    continue
-                last = hist[-1]
-                st = last.get("status", "UNKNOWN")
-                filled = int(last.get("filled_quantity") or 0)
-                avg = last.get("average_price")
+                w.order_id = o.get("order_id") or w.order_id
+                st = o.get("status", "UNKNOWN")
+                filled = int(o.get("filled_quantity") or 0)
+                avg = o.get("average_price")
                 avg = float(avg) if avg else None
                 if st in FINAL:
-                    self._final(w, st, filled, avg, last.get("status_message") or "")
+                    self._final(w, st, filled, avg, o.get("status_message") or "")
                     continue
                 w.status = st
                 w.filled = filled
@@ -262,8 +332,17 @@ class OrderManager:
                         self._log(w, f"CANCEL SENT (unfilled after {timeout:.0f}s)")
                     except Exception as e:
                         logger.warning("cancel %s: %s", w.order_id, e)
+            self._journal_save()
         finally:
             self._poll_pending.clear()
+
+    def previous_day(self) -> List[WorkingOrder]:
+        with self.lock:
+            return [w for w in self.working.values() if w.status == "PREVIOUS DAY"]
+
+    def settle_external(self, w: WorkingOrder, filled: int, price: Optional[float], why: str):
+        """Close a journal order from outside (previous-day settlement)."""
+        self._final(w, "COMPLETE" if filled > 0 else "CANCELLED", filled, price, why)
 
     def cancel_all(self, why: str):
         if not self.live:
@@ -288,8 +367,6 @@ class OrderManager:
         w.avg_price = avg
         w.message = msg
         w.done = True
-        with self.lock:
-            self.working.pop(w.seq, None)
         self._log(w, status)
         if status != "COMPLETE":
             logger.warning("%s %s %s x%d: %s %s (filled %d)", w.action["kind"], w.txn,
@@ -297,16 +374,21 @@ class OrderManager:
         if filled > 0:
             px = avg if avg else (w.price or float(w.action["price"]))
             try:
-                self.on_fill(w.action, filled, float(px))
+                self.on_fill(w.action, filled, float(px), w.order_id or w.tag)
             except Exception as e:
-                logger.exception("applying fill to the book failed: %s", e)
+                # keep it in the journal so the next start retries it
+                logger.exception("applying fill to the book failed (kept in journal): %s", e)
+                return
+        with self.lock:
+            self.working.pop(w.seq, None)
+        self._journal_save()
 
     def _log(self, w: WorkingOrder, result: str):
         order_row({
             "kind": w.action["kind"], "symbol": w.action["symbol"], "txn": w.txn,
             "order_type": w.order_type, "qty": w.qty,
             "price": f"{w.price:.2f}" if w.price else "",
-            "order_id": w.order_id or "", "status": result, "filled": w.filled,
+            "order_id": w.order_id or "", "tag": w.tag, "status": result, "filled": w.filled,
             "avg_price": f"{w.avg_price:.2f}" if w.avg_price else "",
             "message": w.message, "mode": "LIVE" if self.live else "PAPER",
         })

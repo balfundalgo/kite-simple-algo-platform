@@ -64,7 +64,7 @@ def setup() -> logging.Logger:
 logger = setup()
 
 ORDER_FIELDS = ["time", "broker", "kind", "symbol", "txn", "order_type", "qty",
-                "price", "order_id", "status", "filled", "avg_price", "message", "mode"]
+                "price", "order_id", "tag", "status", "filled", "avg_price", "message", "mode"]
 
 TRADE_FIELDS = ["date", "time", "kind", "symbol", "slot", "qty", "price", "amount",
                 "avg_cost", "realized_pnl", "reason", "mode"]

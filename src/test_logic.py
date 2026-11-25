@@ -18,6 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config  # noqa: E402
 import portfolio as pf  # noqa: E402
+import instruments  # noqa: E402
+import reconcile as rc  # noqa: E402
 from indicators import rsi  # noqa: E402
 from watchlist import resolve, rows_to_items  # noqa: E402
 
@@ -247,6 +249,9 @@ idx = {"YESBANK": {"tradingsymbol": "YESBANK", "name": "YES BANK"},
 check("resolve exact symbol", resolve(pf.WatchItem("WIPRO", 1), idx) == "WIPRO")
 check("resolve by name", resolve(pf.WatchItem("ASHOKLEYLAND", 1, name="ASHOK LEYLAND"), idx) == "ASHOKLEY")
 check("resolve by name prefix", resolve(pf.WatchItem("OLAELECTRIC", 1, name="OLA ELECTRIC"), idx) == "OLAELEC")
+idx["WELCORP"] = {"tradingsymbol": "WELCORP", "name": "WELSPUN CORP"}
+check("resolve truncated Kite name", resolve(pf.WatchItem("WELSPUNCORPORATION", 1,
+                                                          name="WELSPUN CORPORATION"), idx) == "WELCORP")
 check("unknown stays unresolved", resolve(pf.WatchItem("ZZZ", 1, name="NO SUCH CO"), idx) is None)
 
 # ---------------------------------------------------------------- RSI
@@ -262,6 +267,68 @@ mon = datetime(2026, 11, 23, 10, 0, tzinfo=config.IST)
 check("window open Mon 10:00", config.in_window(mon, "09:15", "15:25"))
 check("window shut 09:00", not config.in_window(mon.replace(hour=9, minute=0), "09:15", "15:25"))
 check("window shut Saturday", not config.in_window(mon.replace(day=21), "09:15", "15:25"))
+
+# ---------------------------------------------------------------- stock search
+instruments._set([
+    {"tradingsymbol": "YESBANK", "name": "YES BANK", "instrument_token": 1, "tick_size": 0.01},
+    {"tradingsymbol": "ASHOKLEY", "name": "ASHOK LEYLAND", "instrument_token": 2, "tick_size": 0.05},
+    {"tradingsymbol": "KALYANKJIL", "name": "KALYAN JEWELLERS INDIA", "instrument_token": 3, "tick_size": 0.05},
+    {"tradingsymbol": "BANKBARODA", "name": "BANK OF BARODA", "instrument_token": 4, "tick_size": 0.05},
+    {"tradingsymbol": "MAHABANK", "name": "BANK OF MAHARASHTRA", "instrument_token": 5, "tick_size": 0.01},
+    {"tradingsymbol": "YESBANK-BE", "name": "YES BANK", "instrument_token": 6, "tick_size": 0.01},
+    {"tradingsymbol": "CANBK", "name": "CANARA BANK", "instrument_token": 7, "tick_size": 0.01},
+], "2026-11-21")
+sy = lambda q: [r["tradingsymbol"] for r in instruments.search(q)]  # noqa: E731
+check("search symbol prefix", sy("yes")[0] == "YESBANK")
+check("main listing before -BE", sy("yes") == ["YESBANK", "YESBANK-BE"])
+check("search company name", sy("ashok") == ["ASHOKLEY"])
+check("search later word in name", sy("kalyan") == ["KALYANKJIL"])
+check("search two words", sy("bank maha")[0] == "MAHABANK")
+check("search 'bank of' finds both", set(sy("bank of")) == {"BANKBARODA", "MAHABANK"})
+check("search contains", "CANBK" in sy("canara"))
+check("exact symbol first", sy("canbk")[0] == "CANBK")
+check("no match", sy("zzzz") == [])
+check("empty query", sy("  ") == [])
+check("get listed", instruments.get("CANBK")["name"] == "CANARA BANK")
+check("get unlisted", instruments.get("NOPE") is None)
+
+# ---------------------------------------------------------------- reconciliation
+hold = [{"tradingsymbol": "A", "quantity": 100, "t1_quantity": 0, "used_quantity": 0},
+        {"tradingsymbol": "B", "quantity": 60, "t1_quantity": 0, "used_quantity": 40},
+        {"tradingsymbol": "C", "quantity": 0, "t1_quantity": 50, "used_quantity": 0}]
+pos = [{"tradingsymbol": "B", "product": "CNC", "buy_quantity": 0, "sell_quantity": 40},
+       {"tradingsymbol": "D", "product": "CNC", "buy_quantity": 30, "sell_quantity": 0},
+       {"tradingsymbol": "E", "product": "CNC", "buy_quantity": 30, "sell_quantity": 10},
+       {"tradingsymbol": "F", "product": "MIS", "buy_quantity": 99, "sell_quantity": 0}]
+bq = rc.broker_quantities(hold, pos)
+check("settled holding", bq["A"] == 100)
+check("intraday sale of holding counted once", bq["B"] == 60)
+check("T1 shares counted", bq["C"] == 50)
+check("today's CNC buy counted", bq["D"] == 30)
+check("today's buy partly sold", bq["E"] == 20)
+check("MIS ignored", "F" not in bq)
+rows = {r["symbol"]: r["state"] for r in rc.compare(
+    {"A": 100, "B": 100, "C": 40, "D": 30, "G": 5}, bq, busy={"G"}, kept={})}
+check("match OK", rows["A"] == "OK")
+check("shortfall MISMATCH", rows["B"] == "MISMATCH")
+check("extra shares EXTRA", rows["C"] == "EXTRA")
+check("busy skipped", rows["G"] == "BUSY")
+rows = {r["symbol"]: r["state"] for r in rc.compare({"B": 100}, bq, set(), {"B": 60})}
+check("kept at same Zerodha qty", rows["B"] == "KEPT")
+rows = {r["symbol"]: r["state"] for r in rc.compare({"B": 100}, {"B": 50}, set(), {"B": 60})}
+check("kept but Zerodha changed again -> MISMATCH", rows["B"] == "MISMATCH")
+
+# ---------------------------------------------------------------- applied order ids
+b = fresh()
+b.mark_applied("X1")
+b.mark_applied("X1")
+check("applied once", b.applied_orders == ["X1"] and b.was_applied("X1"))
+check("not applied", not b.was_applied("X2") and not b.was_applied(""))
+b.recon_kept["A"] = 5
+b2 = pf.Book.from_dict(b.to_dict())
+check("applied ids persisted", b2.was_applied("X1") and b2.recon_kept == {"A": 5})
+old = pf.Book.from_dict({"capital": 1, "slots": [{"id": 1, "cash": 1}]})
+check("old book files still load", old.applied_orders == [] and old.recon_kept == {})
 
 print(f"\n{PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)
